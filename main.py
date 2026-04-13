@@ -1,5 +1,6 @@
 import requests
 import json
+import time
 from pathlib import Path
 import ffmpeg
 import os
@@ -13,10 +14,10 @@ load_dotenv()
 API_KEY = os.getenv("WHISPER_API_KEY")
 
 AUDIO_PATH = os.getenv("AUDIO_PATH", "/Users/ziberna/output_fast.wav")
-OUTPUT_PATH_TEXT = "transcription.txt"
-OUTPUT_PATH_JSON = "transcription_timestamps.json"
-CHUNK_DIR = "temp_chunks"
-PROGRESS_FILE = "transcription_progress.json"
+OUTPUT_DIR = "output"
+OUTPUT_PATH_SRT = os.path.join(OUTPUT_DIR, "transcription.srt")
+CHUNK_DIR = os.path.join(OUTPUT_DIR, "temp_chunks")
+PROGRESS_FILE = os.path.join(OUTPUT_DIR, "transcription_progress.json")
 MAX_SIZE_MB = float(os.getenv("MAX_SIZE_MB", "24"))
 
 def load_progress():
@@ -75,20 +76,20 @@ def split_audio_file(file_path):
     chunks = []
     for i in range(num_chunks):
         start_time = i * chunk_duration
-        chunk_path = os.path.join(CHUNK_DIR, f"chunk_{i:03d}.wav")
-        
+        chunk_path = os.path.join(CHUNK_DIR, f"chunk_{i:03d}.mp3")
+
         # Skip if chunk already exists and is processed
         progress = load_progress()
         if chunk_path in progress['processed_chunks']:
             print(f"Chunk {i+1} already processed, skipping creation")
             chunks.append(chunk_path)
             continue
-            
+
         print(f"Creating chunk {i+1}: {chunk_path}")
-        
-        # Use ffmpeg to extract chunk
+
+        # Use ffmpeg to extract chunk as mp3 to keep file size small
         stream = ffmpeg.input(file_path, ss=start_time, t=chunk_duration)
-        stream = ffmpeg.output(stream, chunk_path, acodec='pcm_s16le')
+        stream = ffmpeg.output(stream, chunk_path, acodec='libmp3lame', audio_bitrate='64k')
         ffmpeg.run(stream, overwrite_output=True, quiet=True)
         
         chunks.append(chunk_path)
@@ -102,103 +103,69 @@ def transcribe_chunk(chunk_path, is_first_chunk=""):
     url = "https://api.openai.com/v1/audio/transcriptions"
     headers = {"Authorization": f"Bearer {API_KEY}"}
     
-    with open(chunk_path, "rb") as audio_file:
-        files = {"file": audio_file}
-        data = {
-            "model": "gpt-4o-transcribe",
-            "temperature": "0",
-            "response_format": "json",
-            "timestamp_granularities[]": "word"
-        }
-        
-        if is_first_chunk:
-            print("Sending request for first chunk...")
-        response = requests.post(url, headers=headers, files=files, data=data)
+    max_retries = 5
+    for attempt in range(max_retries):
+        with open(chunk_path, "rb") as audio_file:
+            files = {"file": audio_file}
+            data = {
+                "model": "whisper-1",
+                "response_format": "verbose_json",
+                "timestamp_granularities[]": "segment"
+            }
+
+            if is_first_chunk:
+                print("Sending request for first chunk...")
+            response = requests.post(url, headers=headers, files=files, data=data)
+
+        if response.status_code == 429:
+            retry_after = int(response.headers.get("Retry-After", 2 ** attempt))
+            print(f"Rate limited (429). Retrying in {retry_after}s (attempt {attempt + 1}/{max_retries})...")
+            print(f"Response: {response.text}")
+            time.sleep(retry_after)
+            continue
+
+        if response.status_code >= 500:
+            wait_time = 2 ** attempt
+            print(f"Server error ({response.status_code}). Retrying in {wait_time}s (attempt {attempt + 1}/{max_retries})...")
+            time.sleep(wait_time)
+            continue
+
+        if response.status_code == 400:
+            print(f"Bad request (400). Response: {response.text}")
         response.raise_for_status()
-        
-    return response.json()
+        return response.json()
 
-def merge_transcriptions(transcriptions):
-    """Merge multiple transcription chunks."""
-    merged_text = ""
-    all_words = []
+    response.raise_for_status()  # raise after all retries exhausted
+
+def format_srt_time(seconds):
+    """Format seconds into SRT timestamp: HH:MM:SS,mmm"""
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    s = int(seconds % 60)
+    ms = int((seconds % 1) * 1000)
+    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+def merge_transcriptions(transcriptions, chunk_durations):
+    """Merge verbose_json transcription chunks into SRT, adjusting timestamps."""
+    all_segments = []
     time_offset = 0
-    
-    for i, trans in enumerate(transcriptions):
-        # Add text
-        merged_text += trans.get('text', '') + " "
-        
-        # Adjust timestamps for words
-        chunk_words = trans.get('words', [])
-        for word in chunk_words:
-            word['start'] += time_offset
-            word['end'] += time_offset
-        all_words.extend(chunk_words)
-        
-        # Update time offset for next chunk
-        if chunk_words:
-            time_offset = chunk_words[-1]['end']
-    
-    return {
-        'text': merged_text.strip(),
-        'words': all_words
-    }
 
-def parse_progress_file(progress_file_path="transcription_progress.json", interval_minutes=1):
-    """Parse progress file and group text into minute intervals."""
-    try:
-        with open(progress_file_path, 'r', encoding='utf-8') as f:
-            progress_data = json.load(f)
-        
-        # Collect all words from all chunks
-        all_words = []
-        for chunk_data in progress_data['processed_chunks'].values():
-            if 'words' in chunk_data:
-                all_words.extend(chunk_data['words'])
-        
-        # Sort words by start time
-        all_words.sort(key=lambda x: x['start'])
-        
-        # Group into minute intervals
-        interval_seconds = interval_minutes * 60
-        intervals = {}
-        
-        for word in all_words:
-            interval_index = int(word['start'] // interval_seconds)
-            start_time = interval_index * interval_seconds
-            end_time = start_time + interval_seconds
-            
-            interval_key = f"{start_time//60:02d}:{start_time%60:02d}-{end_time//60:02d}:{end_time%60:02d}"
-            
-            if interval_key not in intervals:
-                intervals[interval_key] = {
-                    'text': '',
-                    'words': [],
-                    'start_time': start_time,
-                    'end_time': end_time
-                }
-            
-            intervals[interval_key]['words'].append(word)
-            intervals[interval_key]['text'] += word['text'] + ' '
-        
-        # Sort intervals by time and create output
-        sorted_intervals = dict(sorted(intervals.items(), key=lambda x: x[1]['start_time']))
-        
-        # Save to file
-        output_path = "transcription_by_intervals.txt"
-        with open(output_path, 'w', encoding='utf-8') as f:
-            for time_range, data in sorted_intervals.items():
-                f.write(f"\n[{time_range}]\n")
-                f.write(data['text'].strip() + "\n")
-                f.write("-" * 80 + "\n")
-        
-        print(f"\nTranscription grouped by {interval_minutes}-minute intervals saved to: {output_path}")
-        
-        return sorted_intervals
-        
-    except Exception as e:
-        print(f"Error parsing progress file: {str(e)}")
-        return None
+    for i, result in enumerate(transcriptions):
+        for seg in result.get('segments', []):
+            start = seg['start'] + time_offset
+            end = seg['end'] + time_offset
+            text = seg['text'].strip()
+            all_segments.append((start, end, text))
+        time_offset += chunk_durations[i]
+
+    srt_lines = []
+    for idx, (start, end, text) in enumerate(all_segments, 1):
+        srt_lines.append(f"{idx}")
+        srt_lines.append(f"{format_srt_time(start)} --> {format_srt_time(end)}")
+        srt_lines.append(text)
+        srt_lines.append("")
+
+    return '\n'.join(srt_lines)
 
 def main():
     try:
@@ -215,7 +182,8 @@ def main():
             print(f"Error: Audio file not found at {AUDIO_PATH}")
             return
         
-        # Create temporary directory
+        # Create output and temporary directories
+        os.makedirs(OUTPUT_DIR, exist_ok=True)
         setup_temp_directory()
         
         # Split file if needed
@@ -226,6 +194,11 @@ def main():
         else:
             chunk_paths = [AUDIO_PATH]
         
+        # Get chunk durations for timestamp offset calculation
+        chunk_durations = []
+        for chunk_path in chunk_paths:
+            chunk_durations.append(get_audio_duration(chunk_path))
+
         # Process each chunk
         transcriptions = []
         for i, chunk_path in enumerate(chunk_paths):
@@ -236,47 +209,34 @@ def main():
                     print(f"Loading previously processed chunk {i+1}/{len(chunk_paths)}")
                     transcriptions.append(progress['processed_chunks'][chunk_path])
                     continue
-                
+
                 is_first_chunk = (i == 0)
                 result = transcribe_chunk(chunk_path, is_first_chunk)
                 transcriptions.append(result)
-                
+
                 # Save progress after each chunk
                 save_progress(chunk_path, result)
-                
+
                 print(f"Successfully transcribed chunk {i+1}/{len(chunk_paths)}")
             except Exception as e:
                 print(f"Error processing chunk {i+1}: {str(e)}")
                 raise
-        
+
         # Merge results
         print("\nMerging transcriptions...")
-        merged_result = merge_transcriptions(transcriptions)
-        
+        merged_result = merge_transcriptions(transcriptions, chunk_durations)
+
         # Save results
-        print(f"Saving plain text transcription to {OUTPUT_PATH_TEXT}")
-        with open(OUTPUT_PATH_TEXT, "w", encoding="utf-8") as f:
-            f.write(merged_result['text'])
-        
-        print(f"Saving timestamped transcription to {OUTPUT_PATH_JSON}")
-        with open(OUTPUT_PATH_JSON, "w", encoding="utf-8") as f:
-            json.dump(merged_result, f, ensure_ascii=False, indent=2)
-        
+        print(f"Saving SRT transcription to {OUTPUT_PATH_SRT}")
+        with open(OUTPUT_PATH_SRT, "w", encoding="utf-8") as f:
+            f.write(merged_result)
+
         # Mark transcription as completed
         mark_completed()
-        
+
         # Print sample
         print("\nTranscription completed successfully!")
-        print(f"Text version saved to: {OUTPUT_PATH_TEXT}")
-        print(f"Timestamped version saved to: {OUTPUT_PATH_JSON}")
-        
-        print("\nFirst few words with timestamps:")
-        for word in merged_result['words'][:5]:
-            print(f"Word: {word['word']}, Start: {word['start']:.2f}s, End: {word['end']:.2f}s")
-            
-        if progress.get('completed', False):
-            print("\nCreating time-grouped transcription...")
-            parse_progress_file(interval_minutes=1)  # You can adjust the interval
+        print(f"SRT saved to: {OUTPUT_PATH_SRT}")
         
     except Exception as e:
         print(f"Error: {str(e)}")
